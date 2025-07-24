@@ -1,10 +1,16 @@
 import subprocess  # 외부 명령 실행을 위한 모듈
 import cv2         # OpenCV 라이브러리 (이미지 처리 및 GUI)
 
+
 click_pos = None  # 클릭한 화면상의 좌표를 저장할 변수
 clicked   = False # 클릭이 발생했는지 여부 플래그
+def wake_device():
+    """화면이 꺼져 있어도 깨우기"""
+    subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=True)
 
-def capture_screenshot(path="screen.png"):
+target_path = "target.png"  # 기본 스크린샷 저장 경로
+threshold = 0.95  # 유사도 임계값 (0.95 이상인 경우에만 클릭)
+def capture_screenshot(path=target_path):
     """
     ADB를 통해 연결된 Android 기기에서
     화면을 캡처하여 로컬 파일로 저장합니다.
@@ -16,7 +22,6 @@ def capture_screenshot(path="screen.png"):
             stdout=f,    # 표준 출력을 파일에 기록
             check=True   # 에러 발생 시 예외 발생
         )
-    print(f"[✔] Screenshot saved to {path}")
 
 def mouse_callback(event, x, y, flags, param):
     """
@@ -28,9 +33,8 @@ def mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN and not clicked:
         click_pos = (x, y)  # 화면 표시 좌표 저장
         clicked   = True    # 클릭 완료 표시
-        print(f"[🖱️] Click at display coords: {click_pos}")
 
-def show_and_record(path="screen.png", max_w=800, max_h=600):
+def show_and_record(path=target_path, max_w=800, max_h=600):
     """
     1) 저장된 스크린샷을 로드
     2) max_w * max_h 범위 내에서 비율을 유지하며 리사이즈
@@ -51,20 +55,25 @@ def show_and_record(path="screen.png", max_w=800, max_h=600):
     resized = cv2.resize(img, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
 
     # 4) 윈도우 생성 및 크기 설정
-    cv2.namedWindow("Mobile Screen", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Mobile Screen", disp_w, disp_h)
+    win_name = "Mobile Screen"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, disp_w, disp_h)
 
     # 5) 클릭 이벤트 콜백 등록
     cv2.setMouseCallback("Mobile Screen", mouse_callback)
 
-    print("👉 화면을 클릭하면 좌표를 기록하고 바로 종료됩니다.")
     # 6) 클릭이 발생할 때까지 루프 실행
     while not clicked:
         cv2.imshow("Mobile Screen", resized)
         cv2.waitKey(1)  # 창이 멈추지 않도록 이벤트 처리만 수행
+        if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+            break
 
     # 7) 창 닫기
     cv2.destroyAllWindows()
+    if click_pos is None:
+        print("[ℹ] 클릭이 없어서 좌표가 없습니다.")
+        return None, None
 
     # 8) 클릭된 화면 좌표 -> 정규화된 비율 계산
     x_disp, y_disp = click_pos
@@ -72,15 +81,38 @@ def show_and_record(path="screen.png", max_w=800, max_h=600):
     y_norm = y_disp / disp_h
 
     # 9) 원본 해상도 좌표로 변환
-    orig_x = int(x_norm * w)
-    orig_y = int(y_norm * h)
-    print(f"[✔] Original coords: ({orig_x}, {orig_y})")
+    x = int(x_norm * w)
+    y = int(y_norm * h)
 
-    return orig_x, orig_y
+    return x, y
+
+def calc_histogram(image_path):
+    """
+    주어진 이미지 파일 경로에서 이미지를 읽어
+    그레이스케일 변환 후 히스토그램을 계산하여 반환합니다.
+    """
+    img = cv2.imread(image_path)
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([img_gray], [0], None, [256], [0, 256])
+    return hist
 
 if __name__ == "__main__":
+    # 꺼져있는 화면 깨우기
+    wake_device()
     # 스크린샷 캡처
-    capture_screenshot("screen.png")
+    capture_screenshot(target_path)
     # 화면 표시 & 클릭 좌표 획득
-    final_pos = show_and_record("screen.png")
-    print(f"🎯 최종 좌표: {final_pos}")
+    x,y = show_and_record(target_path)
+    print(f"최종 좌표: ({x},{y})")
+    target_hist = calc_histogram(target_path)
+    while True:
+        subprocess.run(['adb', 'shell', 'screencap', '-p', '/sdcard/screenshot.png'], check=True)
+        subprocess.run(['adb', 'pull', '/sdcard/screenshot.png', 'screenshot.png'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        screen_hist = calc_histogram('screenshot.png')
+
+        similarity = cv2.compareHist(screen_hist,target_hist,cv2.HISTCMP_CORREL)
+        print("유사도 :",int(similarity*100),"%")
+        if similarity > threshold:
+            print("유사도 일치, 클릭 발생!")
+            subprocess.run(
+                ["adb", "shell", "input", "tap", str(x), str(y)],check=True)
